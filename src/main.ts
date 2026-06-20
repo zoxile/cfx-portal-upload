@@ -1,11 +1,12 @@
 import * as core from '@actions/core'
-import puppeteer, { Browser, Page } from 'puppeteer'
+import puppeteer from 'puppeteer'
+import type { Browser, Page } from 'puppeteer'
 import FormData from 'form-data'
 import axios from 'axios'
 
 import { createReadStream, statSync } from 'fs'
 import { basename } from 'path'
-import { ReUploadResponse, SSOResponseBody } from './types'
+import { ReUploadResponse, SSOResponseBody } from './types.js'
 import {
   deleteIfExists,
   resolveAssetId,
@@ -18,23 +19,26 @@ import {
   getChangelog,
   getAssetVersions,
   deleteAssetVersion
-} from './utils'
+} from './utils.js'
 
 /**
  * The main function for the action.
  * @returns {Promise<void>} Resolves when the action is complete.
  */
 export async function run(): Promise<void> {
-  await preparePuppeteer()
-
-  const browser = await puppeteer.launch({
-    headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox']
-  })
-
-  const page = await browser.newPage()
+  let browser: Browser | undefined
 
   try {
+    const executablePath = await preparePuppeteer()
+
+    browser = await puppeteer.launch({
+      headless: true,
+      executablePath,
+      args: ['--no-sandbox', '--disable-setuid-sandbox']
+    })
+
+    const page = await browser.newPage()
+
     let assetId = core.getInput('assetId')
     let assetName = core.getInput('assetName')
 
@@ -46,6 +50,20 @@ export async function run(): Promise<void> {
 
     const chunkSize = parseInt(core.getInput('chunkSize'))
     const maxRetries = parseInt(core.getInput('maxRetries'))
+
+    if (isNaN(chunkSize)) {
+      throw new Error('Invalid chunk size. Must be a number.')
+    }
+
+    if (isNaN(maxRetries)) {
+      throw new Error('Invalid max retries. Must be a number.')
+    }
+
+    if (skipUpload) {
+      await loginToPortal(browser, page, maxRetries)
+      core.info('Skipping upload...')
+      return
+    }
 
     const betaInput = core.getInput('beta').toLowerCase()
     let beta = false
@@ -60,67 +78,42 @@ export async function run(): Promise<void> {
 
     const changelog = await getChangelog(zipPath)
 
-    if (isNaN(chunkSize)) {
-      throw new Error('Invalid chunk size. Must be a number.')
-    }
-
-    if (isNaN(maxRetries)) {
-      throw new Error('Invalid max retries. Must be a number.')
-    }
-
     // No asset id or name provided, using the repository name
-    // If skipUpload is true, we don't need to update the asset name
-    if (!assetId && !assetName && !skipUpload) {
+    if (!assetId && !assetName) {
       core.debug('No asset id or name provided, using repository name...')
       assetName = basename(getEnv('GITHUB_WORKSPACE'))
     }
 
     const version = await getFxManifestVersion(zipPath)
 
-    const redirectUrl = await getRedirectUrl(page, maxRetries)
-    await setForumCookie(browser, page)
+    await loginToPortal(browser, page, maxRetries)
 
-    await page.goto(redirectUrl, {
-      waitUntil: 'networkidle0'
-    })
+    core.info('Redirected to CFX Portal. Uploading file ...')
+    const cookies = await getCookies(browser)
 
-    if (page.url().includes('portal.cfx.re')) {
-      if (skipUpload) {
-        core.info('Redirected to CFX Portal. Skipping upload ...')
-        return
-      }
+    if (assetName) {
+      assetId = await resolveAssetId(assetName, cookies)
+    }
 
-      core.info('Redirected to CFX Portal. Uploading file ...')
-      const cookies = await getCookies(browser)
+    zipPath = await getZipPath(assetName, zipPath, makeZip)
+    const uploadedVersionId = await uploadZip(
+      zipPath,
+      assetId,
+      chunkSize,
+      cookies,
+      beta,
+      version,
+      changelog
+    )
 
-      if (assetName) {
-        assetId = await resolveAssetId(assetName, cookies)
-      }
-
-      zipPath = await getZipPath(assetName, zipPath, makeZip)
-      const uploadedVersionId = await uploadZip(
-        zipPath,
-        assetId,
-        chunkSize,
-        cookies,
-        beta,
-        version,
-        changelog
-      )
-
-      if (deleteOlderVersions) {
-        core.info('Deleting older versions ...')
-        const versions = await getAssetVersions(assetId, cookies)
-        for (const v of versions) {
-          if (v.id !== uploadedVersionId) {
-            await deleteAssetVersion(assetId, v.id, cookies)
-          }
+    if (deleteOlderVersions) {
+      core.info('Deleting older versions ...')
+      const versions = await getAssetVersions(assetId, cookies)
+      for (const v of versions) {
+        if (v.id !== uploadedVersionId) {
+          await deleteAssetVersion(assetId, v.id, cookies)
         }
       }
-    } else {
-      throw new Error(
-        'Redirect failed. Make sure the provided Cookie is valid.'
-      )
     }
   } catch (error) {
     if (axios.isAxiosError(error)) {
@@ -145,8 +138,36 @@ export async function run(): Promise<void> {
       core.setFailed(error.message)
     }
   } finally {
-    await browser.close()
+    await browser?.close()
   }
+}
+
+/**
+ * Logs in to the CFX Portal and waits for the page to load.
+ * If the login fails, it will retry up to `maxRetries` times.
+ * @param browser
+ * @param page
+ * @param maxRetries
+ * @throws If the login fails after `maxRetries` attempts.
+ */
+async function loginToPortal(
+  browser: Browser,
+  page: Page,
+  maxRetries: number
+): Promise<void> {
+  const redirectUrl = await getRedirectUrl(page, maxRetries)
+  await setForumCookie(browser, page)
+
+  await page.goto(redirectUrl, {
+    waitUntil: 'networkidle0'
+  })
+
+  if (page.url().includes('portal.cfx.re')) {
+    core.info('Redirected to CFX Portal.')
+    return
+  }
+
+  throw new Error('Redirect failed. Make sure the provided Cookie is valid.')
 }
 
 /**
@@ -217,10 +238,8 @@ async function setForumCookie(browser: Browser, page: Page): Promise<void> {
     domain: 'forum.cfx.re',
     path: '/',
     expires: -1,
-    size: 1,
     httpOnly: true,
-    secure: true,
-    session: false
+    secure: true
   })
 
   await page.evaluate(() => document.write('Cookie' + document.cookie))
