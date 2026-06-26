@@ -1,41 +1,52 @@
 import * as core from '@actions/core'
-import puppeteer, { Browser, Page } from 'puppeteer'
+import puppeteer from 'puppeteer'
+import type { Browser, Page } from 'puppeteer'
 import FormData from 'form-data'
 import axios from 'axios'
 
 import { createReadStream, statSync } from 'fs'
 import { basename } from 'path'
-import { ReUploadResponse, SSOResponseBody } from './types'
+import { ReUploadResponse, SSOResponseBody } from './types.js'
 import {
   deleteIfExists,
   resolveAssetId,
   getEnv,
   getUrl,
   preparePuppeteer,
-  zipAsset
-} from './utils'
+  zipAsset,
+  isBetaAsset,
+  getFxManifestVersion,
+  getChangelog,
+  getAssetVersions,
+  deleteAssetVersion
+} from './utils.js'
 
 /**
  * The main function for the action.
  * @returns {Promise<void>} Resolves when the action is complete.
  */
 export async function run(): Promise<void> {
-  await preparePuppeteer()
-
-  const browser = await puppeteer.launch({
-    headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox']
-  })
-
-  const page = await browser.newPage()
+  let browser: Browser | undefined
 
   try {
+    const executablePath = await preparePuppeteer()
+
+    browser = await puppeteer.launch({
+      headless: true,
+      executablePath,
+      args: ['--no-sandbox', '--disable-setuid-sandbox']
+    })
+
+    const page = await browser.newPage()
+
     let assetId = core.getInput('assetId')
     let assetName = core.getInput('assetName')
 
     let zipPath = core.getInput('zipPath')
     const makeZip = core.getInput('makeZip').toLowerCase() === 'true'
     const skipUpload = core.getInput('skipUpload').toLowerCase() === 'true'
+    const deleteOlderVersions =
+      core.getInput('deleteOlderVersions').toLowerCase() === 'true'
 
     const chunkSize = parseInt(core.getInput('chunkSize'))
     const maxRetries = parseInt(core.getInput('maxRetries'))
@@ -48,47 +59,115 @@ export async function run(): Promise<void> {
       throw new Error('Invalid max retries. Must be a number.')
     }
 
+    if (skipUpload) {
+      await loginToPortal(browser, page, maxRetries)
+      core.info('Skipping upload...')
+      return
+    }
+
+    const betaInput = core.getInput('beta').toLowerCase()
+    let beta = false
+
+    if (betaInput === 'true') {
+      beta = true
+    } else if (betaInput === 'false') {
+      beta = false
+    } else {
+      beta = await isBetaAsset(zipPath)
+    }
+
+    const changelog = await getChangelog(zipPath)
+
     // No asset id or name provided, using the repository name
-    // If skipUpload is true, we don't need to update the asset name
-    if (!assetId && !assetName && !skipUpload) {
+    if (!assetId && !assetName) {
       core.debug('No asset id or name provided, using repository name...')
       assetName = basename(getEnv('GITHUB_WORKSPACE'))
     }
 
-    const redirectUrl = await getRedirectUrl(page, maxRetries)
-    await setForumCookie(browser, page)
+    const version = await getFxManifestVersion(zipPath)
 
-    await page.goto(redirectUrl, {
-      waitUntil: 'networkidle0'
-    })
+    await loginToPortal(browser, page, maxRetries)
 
-    if (page.url().includes('portal.cfx.re')) {
-      if (skipUpload) {
-        core.info('Redirected to CFX Portal. Skipping upload ...')
-        return
+    core.info('Redirected to CFX Portal. Uploading file ...')
+    const cookies = await getCookies(browser)
+
+    if (assetName) {
+      assetId = await resolveAssetId(assetName, cookies)
+    }
+
+    zipPath = await getZipPath(assetName, zipPath, makeZip)
+    const uploadedVersionId = await uploadZip(
+      zipPath,
+      assetId,
+      chunkSize,
+      cookies,
+      beta,
+      version,
+      changelog
+    )
+
+    if (deleteOlderVersions) {
+      core.info('Deleting older versions ...')
+      const versions = await getAssetVersions(assetId, cookies)
+      for (const v of versions) {
+        if (v.id !== uploadedVersionId) {
+          await deleteAssetVersion(assetId, v.id, cookies)
+        }
       }
-
-      core.info('Redirected to CFX Portal. Uploading file ...')
-      const cookies = await getCookies(browser)
-
-      if (assetName) {
-        assetId = await resolveAssetId(assetName, cookies)
-      }
-
-      zipPath = await getZipPath(assetName, zipPath, makeZip)
-      await uploadZip(zipPath, assetId, chunkSize, cookies)
-    } else {
-      throw new Error(
-        'Redirect failed. Make sure the provided Cookie is valid.'
-      )
     }
   } catch (error) {
-    if (error instanceof Error) {
+    if (axios.isAxiosError(error)) {
+      type ErrorData = {
+        message?: string
+        errors?: string
+      }
+
+      const status = error.response?.status
+      const data = error.response?.data as ErrorData | undefined
+      const message = error.message
+
+      core.error(`API Request failed [${status}]: ${message}`)
+      if (data) {
+        core.error(`Response body: ${JSON.stringify(data, null, 2)}`)
+      }
+
+      core.setFailed(
+        data?.message || data?.errors || message || 'Unknown error'
+      )
+    } else if (error instanceof Error) {
       core.setFailed(error.message)
     }
   } finally {
-    await browser.close()
+    await browser?.close()
   }
+}
+
+/**
+ * Logs in to the CFX Portal and waits for the page to load.
+ * If the login fails, it will retry up to `maxRetries` times.
+ * @param browser
+ * @param page
+ * @param maxRetries
+ * @throws If the login fails after `maxRetries` attempts.
+ */
+async function loginToPortal(
+  browser: Browser,
+  page: Page,
+  maxRetries: number
+): Promise<void> {
+  const redirectUrl = await getRedirectUrl(page, maxRetries)
+  await setForumCookie(browser, page)
+
+  await page.goto(redirectUrl, {
+    waitUntil: 'networkidle0'
+  })
+
+  if (page.url().includes('portal.cfx.re')) {
+    core.info('Redirected to CFX Portal.')
+    return
+  }
+
+  throw new Error('Redirect failed. Make sure the provided Cookie is valid.')
 }
 
 /**
@@ -159,10 +238,8 @@ async function setForumCookie(browser: Browser, page: Page): Promise<void> {
     domain: 'forum.cfx.re',
     path: '/',
     expires: -1,
-    size: 1,
     httpOnly: true,
-    secure: true,
-    session: false
+    secure: true
   })
 
   await page.evaluate(() => document.write('Cookie' + document.cookie))
@@ -224,6 +301,9 @@ async function getZipPath(
  * @param assetId
  * @param chunkSize
  * @param cookies
+ * @param beta
+ * @param version
+ * @param changelog
  * @returns {Promise<[number, number]>} Resolves when the re-upload process is initiated successfully.
  * @throws If the re-upload fails due to errors in the response.
  */
@@ -231,7 +311,10 @@ async function startReupload(
   zipPath: string,
   assetId: string,
   chunkSize: number,
-  cookies: string
+  cookies: string,
+  beta: boolean,
+  version: string,
+  changelog: string
 ): Promise<[number, number]> {
   const stats = statSync(zipPath)
   const totalSize = stats.size
@@ -244,6 +327,9 @@ async function startReupload(
   core.debug(`Original file name: ${originalFileName}`)
   core.debug(`Chunk size: ${chunkSize}`)
   core.debug(`Chunk count: ${chunkCount}`)
+  core.debug(`Beta: ${beta}`)
+  core.debug(`Version: ${version}`)
+  core.debug(`Changelog: ${changelog}`)
 
   const reUploadResponse = await axios.post<ReUploadResponse>(
     getUrl('REUPLOAD', { id: assetId }),
@@ -252,7 +338,11 @@ async function startReupload(
       chunk_size: chunkSize,
       name: originalFileName,
       original_file_name: originalFileName,
-      total_size: totalSize
+      total_size: totalSize,
+
+      release_candidate: beta,
+      version: version,
+      changelog: changelog
     },
     {
       headers: {
@@ -277,20 +367,29 @@ async function startReupload(
  * @param assetId
  * @param chunkSize.
  * @param cookies
- * @returns {Promise<void>} Resolves when the upload is complete.
+ * @param beta
+ * @param version
+ * @param changelog
+ * @returns {Promise<number>} Resolves with the uploaded version ID when the upload is complete.
  * @throws If the upload fails at any stage.
  */
 async function uploadZip(
   zipPath: string,
   assetId: string,
   chunkSize: number,
-  cookies: string
-): Promise<void> {
+  cookies: string,
+  beta: boolean,
+  version: string,
+  changelog: string
+): Promise<number> {
   const [assetIdReupload, versionId] = await startReupload(
     zipPath,
     assetId,
     chunkSize,
-    cookies
+    cookies,
+    beta,
+    version,
+    changelog
   )
 
   let chunkIndex = 0
@@ -326,6 +425,8 @@ async function uploadZip(
   }
 
   await completeUpload(assetIdReupload, versionId, cookies)
+
+  return versionId
 }
 
 /**
